@@ -15,11 +15,13 @@
 from contextlib import contextmanager
 
 import torch
+import torch.nn.functional as F
 
 from nemo.collections.common.parts import NEG_INF, mask_padded_tokens
 
 __all__ = [
     "GreedySequenceGenerator",
+    "GumbelSequenceGenerator",
     "TopKSequenceGenerator",
     "BeamSearchSequenceGenerator",
     "BeamSearchSequenceGeneratorWithLanguageModel",
@@ -216,6 +218,131 @@ class GreedySequenceGenerator:
             yield
         finally:
             self.unfreeze()
+
+
+class GumbelSequenceGenerator(GreedySequenceGenerator):
+    """
+    TODO
+
+    Args:
+        *all args of GreedySequenceGenerator class
+        temperature: temperature of top-k sampling, all logits are divided
+            by temperature before rescaling. High temperature leads to
+            uniform distribution, low leads to delta-like distribution.
+    Kwargs:
+        all remaining parameters of GreedySequenceGenerator class
+    """
+
+    def __init__(self, embedding, decoder, log_softmax, temperature=0.1, **kwargs):
+        super().__init__(embedding, decoder, log_softmax, **kwargs)
+        self.temp = temperature
+
+    def __call__(
+        self, decoder_input_ids=None, encoder_hidden_states=None, encoder_input_mask=None, return_beam_scores=False
+    ):
+        return self._forward(
+            decoder_input_ids, encoder_hidden_states, encoder_input_mask, return_beam_scores,
+        )
+
+    @staticmethod
+    def gumbel_softmax(logits, temperature, eps=1e-10):
+        """
+        Apply the Gumbel-Softmax trick to sample from the categorical distribution.
+        
+        :param logits: Tensor containing logits for each class.
+        :param temperature: Temperature parameter controlling the smoothness/sharpness of the distribution.
+        :param eps: Small epsilon for numerical stability.
+        :return: Gumbel-Softmax distribution based sample.
+        """
+        # Generate Gumbel noise
+        gumbel_noise = -torch.log(-torch.log(torch.rand_like(logits) + eps) + eps)
+        
+        # Add Gumbel noise to the logits
+        gumbel_logits = logits + gumbel_noise
+        
+        # Compute the softmax over the logits added with Gumbel noise
+        y_soft = F.softmax(gumbel_logits / temperature, dim=-1)
+        
+        # Optionally, you can use a straight-through version for the forward pass
+        # Create a hard version by converting to one-hot (not differentiable)
+        _, k = y_soft.max(-1, keepdim=True)
+        y_hard = torch.zeros_like(logits).scatter_(-1, k, 1.0)
+        
+        # Combine soft and hard samples for the Straight-Through Gumbel-Softmax Estimator
+        # It behaves like hard in the forward pass and soft in the backward pass
+        y = y_hard - y_soft.detach() + y_soft
+
+        log_probs = F.log_softmax(logits, dim=-1)
+        model_score = (y_hard * log_probs).sum(-1)
+
+        return y, model_score
+
+    def _one_step_forward(
+        self,
+        decoder_input_ids=None,
+        encoder_hidden_states=None,
+        encoder_input_mask=None,
+        decoder_mems_list=None,
+        pos=0,
+    ):
+        decoder_hidden_states = self.embedding.forward(decoder_input_ids, start_pos=pos)
+        decoder_input_mask = mask_padded_tokens(decoder_input_ids, self.pad).float()
+
+        if encoder_hidden_states is not None:
+            decoder_mems_list = self.decoder.forward(
+                decoder_hidden_states,
+                decoder_input_mask,
+                encoder_hidden_states,
+                encoder_input_mask,
+                decoder_mems_list,
+                return_mems=True,
+            )
+        else:
+            decoder_mems_list = self.decoder.forward(
+                decoder_hidden_states, decoder_input_mask, decoder_mems_list, return_mems=True
+            )
+
+        log_softmax_value = self.log_softmax.mlp.log_softmax
+        self.log_softmax.mlp.log_softmax = False
+        logits = self.log_softmax.forward(hidden_states=decoder_mems_list[-1][:, -1:])
+        self.log_softmax.mlp.log_softmax = log_softmax_value
+
+        one_hot, model_score = self.gumbel_softmax(logits, self.temp)
+
+        return one_hot, decoder_mems_list, model_score
+
+    def _forward(
+        self, decoder_input_ids=None, encoder_hidden_states=None, encoder_input_mask=None, return_beam_scores=False
+    ):
+        assert not return_beam_scores
+        tgt, batch_size, max_generation_length = self._prepare_for_search(decoder_input_ids, encoder_hidden_states)
+
+        # pad profile tracks sequences ending with <eos> token to replace
+        # everything after <eos> with <pad> token
+        decoder_parameter = next(self.decoder.parameters())
+        pad_profile = torch.zeros(batch_size, 1).long().to(decoder_parameter.device)
+
+        decoder_mems_list = None
+        model_scores = []
+        for i in range(max_generation_length):
+
+            log_probs, decoder_mems_list, model_score = self._one_step_forward(
+                tgt[:, -1:], encoder_hidden_states, encoder_input_mask, decoder_mems_list, i
+            )
+            model_scores.append(model_score)
+
+            next_tokens = torch.argmax(log_probs[:, -1], dim=-1, keepdim=True)
+            next_tokens = self.pad * pad_profile + next_tokens * (1 - pad_profile)
+            pad_profile = torch.max(pad_profile, (next_tokens == self.eos).long())
+            tgt = torch.cat((tgt, next_tokens), dim=-1)
+
+            # abort generation if all sequences end with <eos>
+            if pad_profile.sum() == batch_size:
+                break
+
+        model_score = torch.sum(torch.cat(model_scores, dim=-1), dim=-1)
+
+        return tgt, model_score
 
 
 class TopKSequenceGenerator(GreedySequenceGenerator):
@@ -701,10 +828,10 @@ class EnsembleBeamSearchSequenceGenerator:
                 param.requires_grad = False
             self.decoders[model_num].eval()
             for param in self.log_softmaxes[model_num].parameters():
-                param.require_grad = False
+                param.requires_grad = False
             self.log_softmaxes[model_num].eval()
             for param in self.encoders[model_num].parameters():
-                param.require_grad = False
+                param.requires_grad = False
             self.encoders[model_num].eval()
 
     def unfreeze(self) -> None:
@@ -718,10 +845,10 @@ class EnsembleBeamSearchSequenceGenerator:
                 param.requires_grad = True
             self.decoders[model_num].train()
             for param in self.log_softmaxes[model_num].parameters():
-                param.require_grad = True
+                param.requires_grad = True
             self.log_softmaxes[model_num].train()
             for param in self.encoders[model_num].parameters():
-                param.require_grad = True
+                param.requires_grad = True
             self.encoders[model_num].train()
 
     @contextmanager
