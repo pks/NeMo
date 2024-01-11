@@ -233,7 +233,7 @@ class GumbelSequenceGenerator(GreedySequenceGenerator):
         all remaining parameters of GreedySequenceGenerator class
     """
 
-    def __init__(self, embedding, decoder, log_softmax, temperature=0.1, **kwargs):
+    def __init__(self, embedding, decoder, log_softmax, temperature=1.0, **kwargs):
         super().__init__(embedding, decoder, log_softmax, **kwargs)
         self.temp = temperature
 
@@ -340,7 +340,7 @@ class GumbelSequenceGenerator(GreedySequenceGenerator):
             if pad_profile.sum() == batch_size:
                 break
 
-        model_score = torch.sum(torch.cat(model_scores, dim=-1), dim=-1)
+        model_score = torch.sum(torch.cat(model_scores, dim=-1), dim=-1) / i  # TODO: +1?
 
         return tgt, model_score
 
@@ -359,7 +359,7 @@ class TopKSequenceGenerator(GreedySequenceGenerator):
         all remaining parameters of GreedySequenceGenerator class
     """
 
-    def __init__(self, embedding, decoder, log_softmax, beam_size=1, temperature=1.0, **kwargs):
+    def __init__(self, embedding, decoder, log_softmax, beam_size=1, temperature=0.1, **kwargs):
         super().__init__(embedding, decoder, log_softmax, **kwargs)
         self.beam_size = beam_size
         self.temp = temperature
